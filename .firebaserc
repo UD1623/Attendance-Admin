@@ -1,0 +1,7 @@
+{
+  "projects": {
+    "default": "smart-attendance-dev",
+    "dev": "smart-attendance-dev",
+    "prod": "smart-attendance-prod"
+  }
+}

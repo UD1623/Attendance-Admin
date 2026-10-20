@@ -1,0 +1,105 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Helper functions
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isAdmin() {
+      return isAuthenticated() && (request.auth.token.admin == true || request.auth.token.superAdmin == true);
+    }
+
+    function isSuperAdmin() {
+      return isAuthenticated() && request.auth.token.superAdmin == true;
+    }
+
+    // Default deny all
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Admins profile collection (read by admins, written only via Admin SDK / Callable)
+    match /admins/{adminId} {
+      allow read: if isAdmin();
+      allow write: if false;
+    }
+
+    // Institutional settings (read by admins, written only by superAdmin)
+    match /settings/{settingId} {
+      allow read: if isAdmin();
+      allow write: if isSuperAdmin();
+    }
+
+    // Classes & Subjects (read by admins, write by admins)
+    match /classes/{classId} {
+      allow read: if isAdmin();
+      allow write: if isAdmin();
+    }
+
+    match /subjects/{subjectId} {
+      allow read: if isAdmin();
+      allow write: if isAdmin();
+    }
+
+    // Students (read by admins, direct write disallowed - registration goes through callable for unique roll verification)
+    match /students/{studentId} {
+      allow read: if isAdmin();
+      allow write: if false;
+    }
+
+    // Enrollment requests (read by admins, writes handled by Cloud Functions)
+    match /enrollmentRequests/{requestId} {
+      allow read: if isAdmin();
+      allow write: if false;
+    }
+
+    // Timetable (read by admins, write by admins with validation)
+    match /timetable/{timetableId} {
+      allow read: if isAdmin();
+      allow create, update: if isAdmin()
+        && request.resource.data.sessionType == 'lecture'
+        && request.resource.data.dayOfWeek >= 1
+        && request.resource.data.dayOfWeek <= 6;
+      allow delete: if isAdmin();
+    }
+
+    // Lecture sessions (read by admins, write strictly by backend)
+    match /lectureSessions/{sessionId} {
+      allow read: if isAdmin();
+      allow write: if false;
+    }
+
+    // Attendance records (read by admins, strictly NO client writes - Cloud Functions only)
+    match /attendance/{attendanceId} {
+      allow read: if isAdmin();
+      allow write: if false;
+    }
+
+    // Devices (read by admins, write strictly by backend ingestion / Admin SDK)
+    match /devices/{deviceId} {
+      allow read: if isAdmin();
+      allow write: if false;
+    }
+
+    // Device events (read by admins for live feed, write strictly by ingestion endpoint)
+    match /deviceEvents/{eventId} {
+      allow read: if isAdmin();
+      allow write: if false;
+    }
+
+    // Audit logs (read-only for admins, append-only from backend)
+    match /auditLogs/{logId} {
+      allow read: if isAdmin();
+      allow write: if false;
+    }
+
+    // Holidays (read and write by admins)
+    match /holidays/{holidayId} {
+      allow read: if isAdmin();
+      allow write: if isAdmin();
+    }
+  }
+}
