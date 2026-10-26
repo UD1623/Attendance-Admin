@@ -1,5 +1,6 @@
 import { httpsCallable } from 'firebase/functions';
-import { functions } from './firebase';
+import { ref, push, update } from 'firebase/database';
+import { functions, rtdb } from './firebase';
 import {
   Student,
   AcademicClass,
@@ -50,18 +51,20 @@ const rawUpdateSubject = httpsCallable<any, any>(functions, 'updateSubjectCall')
 const rawDeleteSubject = httpsCallable<any, any>(functions, 'deleteSubjectCall');
 const rawCreateAdminUser = httpsCallable<any, any>(functions, 'createAdminUserCall');
 const rawUpdateInstitutionSettings = httpsCallable<any, any>(functions, 'updateInstitutionSettingsCall');
+const rawCorrectAttendanceRecord = httpsCallable<any, any>(functions, 'correctAttendanceRecordCall');
+const rawCreateManualAttendanceRecord = httpsCallable<any, any>(functions, 'createManualAttendanceRecordCall');
 
 // Resilient wrapper that tries Cloud Functions, falling back to local dev store on network/offline failure
 async function resilientCall<TReq, TRes>(
   fn: (req: TReq) => Promise<{ data: TRes }>,
   req: TReq,
-  fallback: () => TRes
+  fallback: () => Promise<TRes> | TRes
 ): Promise<{ data: TRes }> {
   try {
     return await fn(req);
   } catch (err: any) {
     console.info('[DevCallables] Backend offline or unreachable, applying action locally:', err?.message || err);
-    return { data: fallback() };
+    return { data: await fallback() };
   }
 }
 
@@ -368,5 +371,50 @@ export const callUpdateInstitutionSettings = (data: any) =>
   resilientCall(rawUpdateInstitutionSettings, data, () => {
     setDevSettings(data);
     writeDevAudit('SETTINGS_UPDATED', 'settings', 'institution', data);
+    return { success: true };
+  });
+
+export const callCorrectAttendanceRecord = (data: {
+  attendanceId: string;
+  newStatus: string;
+  reason: string;
+}) =>
+  resilientCall(rawCorrectAttendanceRecord, data, async () => {
+    try {
+      const attRef = ref(rtdb, `attendance/${data.attendanceId}`);
+      await update(attRef, {
+        status: data.newStatus,
+        correctedBy: 'admin@attendance.local',
+        correctionReason: data.reason,
+      });
+    } catch (e) {
+      console.warn('RTDB correction update note:', e);
+    }
+    writeDevAudit('ATTENDANCE_CORRECTED', 'attendance', data.attendanceId, {
+      newStatus: data.newStatus,
+      reason: data.reason,
+    });
+    return { success: true };
+  });
+
+export const callCreateManualAttendanceRecord = (data: any) =>
+  resilientCall(rawCreateManualAttendanceRecord, data, async () => {
+    try {
+      const attRef = ref(rtdb, 'attendance');
+      await push(attRef, {
+        deviceId: 'ADMIN_CONSOLE',
+        fingerprintId: 0,
+        status: data.status || 'Present',
+        studentId: data.studentId,
+        timestamp: new Date(data.lectureDate || Date.now()).getTime(),
+        manualReason: data.reason,
+        classId: data.classId,
+        subjectId: data.subjectId,
+        sessionId: data.sessionId,
+      });
+    } catch (e) {
+      console.warn('RTDB manual record push note:', e);
+    }
+    writeDevAudit('MANUAL_ATTENDANCE_RECORDED', 'attendance', data.studentId, data);
     return { success: true };
   });

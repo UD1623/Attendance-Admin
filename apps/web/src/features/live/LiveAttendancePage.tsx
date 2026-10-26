@@ -21,9 +21,11 @@ import {
   limit,
   onSnapshot,
 } from 'firebase/firestore';
-import { db } from '@/lib/firebase';
+import { db, rtdb } from '@/lib/firebase';
+import { ref, push, set } from 'firebase/database';
 import { useRtdbAttendance } from '@/lib/useRtdbAttendance';
-import { DeviceEvent } from '@/types';
+import { useSyncedCollection } from '@/lib/useSyncedData';
+import { DeviceEvent, Student, TimetableEntry, Subject } from '@/types';
 import { StatusBadge, Button, EmptyState } from '@/components';
 import styles from './LiveAttendancePage.module.css';
 
@@ -40,6 +42,15 @@ export const LiveAttendancePage: React.FC = () => {
   const [newestEventId, setNewestEventId] = useState<string | null>(null);
   const [simulating, setSimulating] = useState<boolean>(false);
   const [simFeedback, setSimFeedback] = useState<string | null>(null);
+  const [showSimulator, setShowSimulator] = useState<boolean>(false);
+
+  // Synced academic rosters to enrich raw hardware scans with real student names & subjects
+  const { data: students } = useSyncedCollection<Student>('students', 'studentId');
+  const { data: timetable } = useSyncedCollection<TimetableEntry>('timetable', 'timetableId');
+  const { data: subjects } = useSyncedCollection<Subject>('subjects', 'subjectId');
+
+  // Track previous RTDB record count to detect incoming hardware scans in real time
+  const prevRecordCountRef = useRef<number | null>(null);
 
   // Audio Context ref for chime
   const audioCtxRef = useRef<AudioContext | null>(null);
@@ -123,26 +134,88 @@ export const LiveAttendancePage: React.FC = () => {
     testConnection: testRtdbConnection,
   } = useRtdbAttendance();
 
-  // Combine RTDB records with Firestore events
+  // Detect incoming scans from RTDB in real time and trigger chime + highlight
+  useEffect(() => {
+    if (rtdbRecords.length === 0) {
+      prevRecordCountRef.current = 0;
+      return;
+    }
+    if (prevRecordCountRef.current !== null && rtdbRecords.length > prevRecordCountRef.current) {
+      const newest = rtdbRecords[0];
+      setNewestEventId(newest.recordId);
+      playChime(newest.status);
+    }
+    prevRecordCountRef.current = rtdbRecords.length;
+  }, [rtdbRecords]);
+
+  // Combine RTDB records with Firestore events and enrich with real student & lecture details
   const combinedEvents = useMemo(() => {
-    const rtdbEvents: DeviceEvent[] = rtdbRecords.map((r) => ({
-      eventId: r.recordId,
-      deviceId: r.deviceId || 'ESP32-READER',
-      eventType: 'scan' as const,
-      fingerprintRef: r.fingerprintId,
-      studentId: r.studentId,
-      studentName: r.studentId || `Slot #${r.fingerprintId}`,
-      rollNumber: r.studentId,
-      result: (r.status as any) || 'Present',
-      capturedAt: r.timestamp,
-      receivedAt: r.timestamp,
-      processingStatus: 'processed' as const,
-    }));
+    const todayDay = new Date().getDay();
+    const mappedDay = todayDay === 0 ? 1 : todayDay;
+    const todayLectures = timetable.filter((t) => t.dayOfWeek === mappedDay && t.active !== false);
+
+    const rtdbEvents: DeviceEvent[] = rtdbRecords.map((r) => {
+      // Match student by fingerprintRef or studentId
+      const matchedStudent = students.find((s) => {
+        if (s.fingerprintRef !== null && s.fingerprintRef !== undefined && Number(s.fingerprintRef) === Number(r.fingerprintId)) {
+          return true;
+        }
+        if (s.studentId && r.studentId && s.studentId === r.studentId) {
+          return true;
+        }
+        return false;
+      });
+
+      // Match lecture for student's class
+      const studentClassId = matchedStudent?.classId;
+      const classLecture = studentClassId
+        ? todayLectures.find((l) => l.classId === studentClassId)
+        : todayLectures[0];
+      const subjectDoc = classLecture ? subjects.find((s) => s.subjectId === classLecture.subjectId) : null;
+
+      const isRejected = (r.status as string) === 'Rejected';
+      const isUnenrolled = r.fingerprintId === 99 || (!matchedStudent && !r.studentId);
+
+      const studentName = isUnenrolled
+        ? (matchedStudent ? `${matchedStudent.fullName} (Unmatched Slot #99)` : 'Unenrolled Biometric')
+        : matchedStudent?.fullName ||
+          (r.studentId && !r.studentId.startsWith('std_test') && r.studentId !== 'TEST'
+            ? r.studentId
+            : `Student Slot #${r.fingerprintId}`);
+
+      const rollNumber = isUnenrolled
+        ? (matchedStudent ? `${matchedStudent.rollNumber} [Slot #99]` : 'Slot #99 (No Match)')
+        : matchedStudent?.rollNumber ||
+          (r.fingerprintId ? `Slot #${r.fingerprintId}` : r.studentId || 'N/A');
+
+      const rejectionReason = isRejected
+        ? (r.fingerprintId === 99
+            ? 'Biometric template not recognized in hardware sensor'
+            : 'Attendance scan rejected')
+        : undefined;
+
+      return {
+        eventId: r.recordId,
+        deviceId: r.deviceId || 'ESP32-READER-01',
+        eventType: 'scan' as const,
+        fingerprintRef: r.fingerprintId,
+        studentId: matchedStudent?.studentId || r.studentId,
+        studentName,
+        rollNumber,
+        subjectName: subjectDoc?.name || (classLecture ? classLecture.subjectId : 'Live Lecture'),
+        sessionId: classLecture?.timetableId || 'Session Active',
+        result: (r.status as any) || 'Present',
+        rejectionReason,
+        capturedAt: r.timestamp,
+        receivedAt: r.timestamp,
+        processingStatus: 'processed' as const,
+      };
+    });
 
     const existingIds = new Set(rtdbEvents.map((e) => e.eventId));
     const uniqueFirestore = events.filter((e) => !existingIds.has(e.eventId));
     return [...rtdbEvents, ...uniqueFirestore];
-  }, [rtdbRecords, events]);
+  }, [rtdbRecords, events, students, timetable, subjects]);
 
   // KPI Calculations
   const stats = useMemo(() => {
@@ -194,36 +267,57 @@ export const LiveAttendancePage: React.FC = () => {
     });
   }, [combinedEvents, selectedFilter, searchQuery]);
 
-  // Quick simulator action trigger
+  // Quick simulator action trigger that writes directly to Firebase RTDB for immediate real-time stream
   const runSimulatorAction = async (payload: any, label: string) => {
     setSimulating(true);
-    setSimFeedback(`Dispatching: ${label}...`);
+    setSimFeedback(`Emitting: ${label}...`);
     try {
-      const isHeartbeat = payload.isHeartbeat;
-      const url = `${FUNCTIONS_BASE}/${isHeartbeat ? 'deviceHeartbeat' : 'processScan'}`;
+      if (!payload.isHeartbeat && payload.fingerprintRef) {
+        // Direct stream to Realtime Database /attendance path
+        const attendanceRef = ref(rtdb, 'attendance');
+        const student = students.find((s) => s.fingerprintRef === payload.fingerprintRef);
+        await push(attendanceRef, {
+          deviceId: 'ESP32-READER-01',
+          fingerprintId: payload.fingerprintRef,
+          status: payload.testTimeOverride === '09:20' ? 'Late' : payload.fingerprintRef === 99 ? 'Rejected' : 'Present',
+          studentId: student?.studentId || (payload.fingerprintRef === 1 ? 'std_101' : 'std_102'),
+          timestamp: Date.now(),
+        });
+        setSimFeedback(`✅ Live event streamed directly to Firebase RTDB!`);
+      } else if (payload.isHeartbeat) {
+        const devRef = ref(rtdb, 'devices/ESP32-READER-01');
+        await set(devRef, {
+          freeHeap: payload.freeHeap || 235000,
+          lastHeartbeat: Date.now(),
+          sensorStatus: payload.sensorStatus || 'ok',
+          status: 'online',
+          wifiSignalRssi: payload.wifiSignalRssi || -46,
+        });
+        setSimFeedback(`✅ Live ESP32 Heartbeat pushed to RTDB!`);
+      }
 
-      const res = await fetch(url, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-device-id': 'ESP32-READER-01',
-          'x-event-id': `sim_${Date.now()}`,
-          'x-timestamp': String(Math.floor(Date.now() / 1000)),
-        },
-        body: JSON.stringify(payload),
-      });
-
-      const data = await res.json();
-      if (res.ok) {
-        setSimFeedback(`✅ ${label}: Evaluated as "${data.result || data.status}"`);
-      } else {
-        setSimFeedback(`❌ ${label} Error: ${data.error || data.message || 'Failed'}`);
+      // Also dispatch to local functions endpoint if running
+      try {
+        const isHeartbeat = payload.isHeartbeat;
+        const url = `${FUNCTIONS_BASE}/${isHeartbeat ? 'deviceHeartbeat' : 'processScan'}`;
+        await fetch(url, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-device-id': 'ESP32-READER-01',
+            'x-event-id': `sim_${Date.now()}`,
+            'x-timestamp': String(Math.floor(Date.now() / 1000)),
+          },
+          body: JSON.stringify(payload),
+        });
+      } catch {
+        // Functions offline is okay, RTDB push succeeded
       }
     } catch (err: any) {
-      setSimFeedback(`💥 Network Error: ${err.message}`);
+      setSimFeedback(`💥 Error: ${err.message}`);
     } finally {
       setSimulating(false);
-      setTimeout(() => setSimFeedback(null), 5000);
+      setTimeout(() => setSimFeedback(null), 4000);
     }
   };
 
@@ -243,14 +337,25 @@ export const LiveAttendancePage: React.FC = () => {
     const hours = String(dateObj.getHours()).padStart(2, '0');
     const mins = String(dateObj.getMinutes()).padStart(2, '0');
     const secs = String(dateObj.getSeconds()).padStart(2, '0');
-    const exact = `${hours}:${mins}:${secs}`;
+    const dateStr = dateObj.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+    const exact = `${hours}:${mins}:${secs} · ${dateStr}`;
 
     const diffSeconds = Math.round((Date.now() - dateObj.getTime()) / 1000);
     let relative = 'Just now';
-    if (diffSeconds > 60) {
+    if (diffSeconds > 86400 * 2) {
+      const days = Math.floor(diffSeconds / 86400);
+      relative = `${days}d ago`;
+    } else if (diffSeconds > 86400) {
+      relative = 'Yesterday';
+    } else if (diffSeconds > 3600) {
+      const hours = Math.floor(diffSeconds / 3600);
+      relative = `${hours}h ago`;
+    } else if (diffSeconds > 60) {
       relative = `${Math.floor(diffSeconds / 60)}m ago`;
     } else if (diffSeconds > 5) {
       relative = `${diffSeconds}s ago`;
+    } else {
+      relative = 'Just now';
     }
 
     return { exact, relative };
@@ -292,6 +397,17 @@ export const LiveAttendancePage: React.FC = () => {
           >
             <Cpu size={14} />
             {isRtdbConnected ? 'RTDB: Online' : 'Test RTDB'}
+          </Button>
+
+          <Button
+            id="btn-toggle-simulator"
+            variant={showSimulator ? 'secondary' : 'ghost'}
+            size="sm"
+            onClick={() => setShowSimulator(!showSimulator)}
+            title="Toggle Hardware Simulator controls"
+          >
+            <Zap size={14} color={showSimulator ? '#2563EB' : 'currentColor'} />
+            {showSimulator ? 'Hide Simulator' : 'Simulator'}
           </Button>
 
           <Button
@@ -360,102 +476,104 @@ export const LiveAttendancePage: React.FC = () => {
         </div>
       </div>
 
-      {/* Hardware Simulator Quick Action Bar */}
-      <div className={styles.simulatorBox}>
-        <div className={styles.simulatorHeader}>
-          <div>
-            <div className={styles.simulatorTitle}>
-              <Zap size={16} color="#2563EB" />
-              Hardware Simulator Quick Launch
+      {/* Hardware Simulator Quick Action Bar (Collapsible to keep live feed table front-and-center) */}
+      {showSimulator && (
+        <div className={styles.simulatorBox}>
+          <div className={styles.simulatorHeader}>
+            <div>
+              <div className={styles.simulatorTitle}>
+                <Zap size={16} color="#2563EB" />
+                Hardware Simulator Quick Launch
+              </div>
+              <p className={styles.simulatorSubtitle}>
+                Dispatch simulated biometric scans and heartbeat pings directly to the Cloud Functions ingestion engine.
+              </p>
             </div>
-            <p className={styles.simulatorSubtitle}>
-              Dispatch simulated biometric scans and heartbeat pings directly to the Cloud Functions ingestion engine.
-            </p>
+            {simFeedback && (
+              <span style={{ fontSize: 'var(--text-xs)', fontWeight: 'var(--font-semibold)', color: 'var(--color-primary)' }}>
+                {simFeedback}
+              </span>
+            )}
           </div>
-          {simFeedback && (
-            <span style={{ fontSize: 'var(--text-xs)', fontWeight: 'var(--font-semibold)', color: 'var(--color-primary)' }}>
-              {simFeedback}
-            </span>
-          )}
+
+          <div className={styles.simulatorButtons}>
+            <button
+              id="sim-scan-aarav"
+              className={styles.simBtn}
+              disabled={simulating}
+              onClick={() =>
+                runSimulatorAction(
+                  { fingerprintRef: 1, testTimeOverride: '09:05', testDayOfWeekOverride: 1 },
+                  'Aarav Sharma (Slot #1 - On Time)'
+                )
+              }
+            >
+              <Fingerprint size={14} color="#10B981" />
+              Scan Aarav (On Time)
+            </button>
+
+            <button
+              id="sim-scan-ananya"
+              className={styles.simBtn}
+              disabled={simulating}
+              onClick={() =>
+                runSimulatorAction(
+                  { fingerprintRef: 2, testTimeOverride: '09:20', testDayOfWeekOverride: 1 },
+                  'Ananya Patel (Slot #2 - Late)'
+                )
+              }
+            >
+              <Clock size={14} color="#F59E0B" />
+              Scan Ananya (Late)
+            </button>
+
+            <button
+              id="sim-scan-duplicate"
+              className={styles.simBtn}
+              disabled={simulating}
+              onClick={() =>
+                runSimulatorAction(
+                  { fingerprintRef: 1, testTimeOverride: '09:06', testDayOfWeekOverride: 1 },
+                  'Duplicate Scan Test (Slot #1)'
+                )
+              }
+            >
+              <RefreshCw size={14} color="#6366F1" />
+              Simulate Rapid Duplicate
+            </button>
+
+            <button
+              id="sim-scan-unknown"
+              className={styles.simBtn}
+              disabled={simulating}
+              onClick={() =>
+                runSimulatorAction(
+                  { fingerprintRef: 99, testTimeOverride: '09:05', testDayOfWeekOverride: 1 },
+                  'Unenrolled Fingerprint (Slot #99)'
+                )
+              }
+            >
+              <XCircle size={14} color="#EF4444" />
+              Unregistered Slot (#99)
+            </button>
+
+            <button
+              id="sim-heartbeat"
+              className={styles.simBtn}
+              disabled={simulating}
+              onClick={() =>
+                runSimulatorAction(
+                  { isHeartbeat: true, sensorStatus: 'ok', firmwareVersion: 'v1.2.0-esp32', wifiSignalRssi: -58, freeHeap: 182400 },
+                  'ESP32 Heartbeat Ping'
+                )
+              }
+            >
+              <Cpu size={14} color="#0284C7" />
+              Device Heartbeat Ping
+            </button>
+          </div>
         </div>
-
-        <div className={styles.simulatorButtons}>
-          <button
-            id="sim-scan-aarav"
-            className={styles.simBtn}
-            disabled={simulating}
-            onClick={() =>
-              runSimulatorAction(
-                { fingerprintRef: 1, testTimeOverride: '09:05', testDayOfWeekOverride: 1 },
-                'Aarav Sharma (Slot #1 - On Time)'
-              )
-            }
-          >
-            <Fingerprint size={14} color="#10B981" />
-            Scan Aarav (On Time)
-          </button>
-
-          <button
-            id="sim-scan-ananya"
-            className={styles.simBtn}
-            disabled={simulating}
-            onClick={() =>
-              runSimulatorAction(
-                { fingerprintRef: 2, testTimeOverride: '09:20', testDayOfWeekOverride: 1 },
-                'Ananya Patel (Slot #2 - Late)'
-              )
-            }
-          >
-            <Clock size={14} color="#F59E0B" />
-            Scan Ananya (Late)
-          </button>
-
-          <button
-            id="sim-scan-duplicate"
-            className={styles.simBtn}
-            disabled={simulating}
-            onClick={() =>
-              runSimulatorAction(
-                { fingerprintRef: 1, testTimeOverride: '09:06', testDayOfWeekOverride: 1 },
-                'Duplicate Scan Test (Slot #1)'
-              )
-            }
-          >
-            <RefreshCw size={14} color="#6366F1" />
-            Simulate Rapid Duplicate
-          </button>
-
-          <button
-            id="sim-scan-unknown"
-            className={styles.simBtn}
-            disabled={simulating}
-            onClick={() =>
-              runSimulatorAction(
-                { fingerprintRef: 99, testTimeOverride: '09:05', testDayOfWeekOverride: 1 },
-                'Unenrolled Fingerprint (Slot #99)'
-              )
-            }
-          >
-            <XCircle size={14} color="#EF4444" />
-            Unregistered Slot (#99)
-          </button>
-
-          <button
-            id="sim-heartbeat"
-            className={styles.simBtn}
-            disabled={simulating}
-            onClick={() =>
-              runSimulatorAction(
-                { isHeartbeat: true, sensorStatus: 'ok', firmwareVersion: 'v1.2.0-esp32', wifiSignalRssi: -58, freeHeap: 182400 },
-                'ESP32 Heartbeat Ping'
-              )
-            }
-          >
-            <Cpu size={14} color="#0284C7" />
-            Device Heartbeat Ping
-          </button>
-        </div>
-      </div>
+      )}
 
       {/* Filter and Search Bar */}
       <div className={styles.controlsBar}>
@@ -477,7 +595,7 @@ export const LiveAttendancePage: React.FC = () => {
             className={`${styles.filterChip} ${selectedFilter === 'all' ? styles.activeChip : ''}`}
             onClick={() => setSelectedFilter('all')}
           >
-            All Events ({events.length})
+            All Events ({stats.total})
           </button>
           <button
             id="filter-present"

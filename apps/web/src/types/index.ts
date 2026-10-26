@@ -145,6 +145,7 @@ export interface DeviceInfo {
   secretHash?: string;
   active: boolean;
   status: 'online' | 'offline' | 'pending';
+  sensorStatus?: string;
   lastHeartbeatAt?: any;
   firmwareVersion?: string;
   wifiSignalRssi?: number;
@@ -161,5 +162,7 @@ export interface RtdbAttendanceRecord {
   timestamp: number | string;
   status: string;
   deviceId: string;
+  correctedBy?: string;
+  correctionReason?: string;
 }
 

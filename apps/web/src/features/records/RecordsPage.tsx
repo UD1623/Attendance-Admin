@@ -11,24 +11,46 @@ import {
   Clock,
   ShieldCheck,
   AlertTriangle,
+  FileText,
+  FileSpreadsheet,
 } from 'lucide-react';
 import {
   collection,
   query,
   orderBy,
   onSnapshot,
-  getDocs,
 } from 'firebase/firestore';
-import { httpsCallable } from 'firebase/functions';
-import { db, functions } from '@/lib/firebase';
-import { AttendanceRecord, AcademicClass } from '@/types';
+import { db } from '@/lib/firebase';
+import { useRtdbAttendance } from '@/lib/useRtdbAttendance';
+import { useSyncedCollection } from '@/lib/useSyncedData';
+import {
+  callCorrectAttendanceRecord,
+  callCreateManualAttendanceRecord,
+} from '@/lib/callables';
+import { AttendanceRecord, AcademicClass, Student, Subject, AuditLog, TimetableEntry } from '@/types';
 import { StatusBadge, Button, Modal, EmptyState } from '@/components';
+import {
+  exportAttendanceToPdf,
+  exportAttendanceToDocx,
+  ReportMetadata,
+  ExportAttendanceRow,
+} from './exportUtils';
 import styles from './RecordsPage.module.css';
 
 export const RecordsPage: React.FC = () => {
   const [records, setRecords] = useState<AttendanceRecord[]>([]);
-  const [classes, setClasses] = useState<AcademicClass[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
+  const [activeTab, setActiveTab] = useState<'records' | 'audit'>('records');
+
+  // Real-time Database attendance scans (hardware reader stream)
+  const { records: rtdbRecords } = useRtdbAttendance();
+
+  // Synced academic rosters and audit log
+  const { data: students } = useSyncedCollection<Student>('students', 'studentId');
+  const { data: classes } = useSyncedCollection<AcademicClass>('classes', 'classId');
+  const { data: subjects } = useSyncedCollection<Subject>('subjects', 'subjectId');
+  const { data: timetable } = useSyncedCollection<TimetableEntry>('timetable', 'timetableId');
+  const { data: auditLogs } = useSyncedCollection<AuditLog>('auditLogs', 'id');
 
   // Filters
   const [searchQuery, setSearchQuery] = useState<string>('');
@@ -58,22 +80,12 @@ export const RecordsPage: React.FC = () => {
   const [submittingManual, setSubmittingManual] = useState<boolean>(false);
   const [manualError, setManualError] = useState<string | null>(null);
 
-  // Load Classes
-  useEffect(() => {
-    const fetchClasses = async () => {
-      try {
-        const snap = await getDocs(collection(db, 'classes'));
-        const clsList: AcademicClass[] = [];
-        snap.forEach((d) => clsList.push({ ...d.data(), classId: d.id } as AcademicClass));
-        setClasses(clsList);
-      } catch (err) {
-        console.warn('Failed to load classes:', err);
-      }
-    };
-    fetchClasses();
-  }, []);
+  // Formal Report Export States
+  const [exportingPdf, setExportingPdf] = useState<boolean>(false);
+  const [exportingDocx, setExportingDocx] = useState<boolean>(false);
+  const [exportFeedback, setExportFeedback] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
 
-  // Live Snapshot of Attendance Records
+  // Live Snapshot of Firestore Attendance Records
   useEffect(() => {
     setLoading(true);
     const attRef = collection(db, 'attendance');
@@ -90,7 +102,7 @@ export const RecordsPage: React.FC = () => {
         setLoading(false);
       },
       (error) => {
-        console.warn('Attendance snapshot error:', error);
+        console.warn('Attendance snapshot note:', error);
         setLoading(false);
       }
     );
@@ -98,9 +110,79 @@ export const RecordsPage: React.FC = () => {
     return () => unsubscribe();
   }, []);
 
+  // Map and combine Realtime Database scans with Firestore records
+  const combinedRecords = useMemo(() => {
+    const mappedRtdb: AttendanceRecord[] = rtdbRecords.map((r) => {
+      // Find matching student by fingerprint slot or studentId
+      const matchedStudent = students.find((s) => {
+        if (s.fingerprintRef !== null && s.fingerprintRef !== undefined && Number(s.fingerprintRef) === Number(r.fingerprintId)) {
+          return true;
+        }
+        if (s.studentId && r.studentId && s.studentId === r.studentId) {
+          return true;
+        }
+        return false;
+      });
+
+      const matchedClass = classes.find((c) => c.classId === matchedStudent?.classId) || classes[0];
+      const matchedSubject = subjects[0];
+
+      const isUnenrolled = r.fingerprintId === 99 || (!matchedStudent && !r.studentId);
+      const studentName = isUnenrolled
+        ? 'Unenrolled Biometric'
+        : matchedStudent?.fullName ||
+          (r.studentId && !r.studentId.startsWith('std_test') && r.studentId !== 'TEST'
+            ? r.studentId
+            : `Student Slot #${r.fingerprintId}`);
+
+      const rollNumber = isUnenrolled
+        ? 'Slot #99 (No Match)'
+        : matchedStudent?.rollNumber ||
+          (r.fingerprintId ? `Slot #${r.fingerprintId}` : r.studentId || 'N/A');
+
+      const dateObj = new Date(typeof r.timestamp === 'number' ? r.timestamp : Number(r.timestamp) || Date.now());
+      const lectureDate = !isNaN(dateObj.getTime())
+        ? dateObj.toISOString().split('T')[0]
+        : new Date().toISOString().split('T')[0];
+
+      return {
+        attendanceId: r.recordId,
+        studentId: matchedStudent?.studentId || r.studentId,
+        studentName,
+        rollNumber,
+        classId: matchedClass?.classId || 'class_ce_5a',
+        className: matchedClass?.name || 'Computer Engineering - Sem 5',
+        subjectId: matchedSubject?.name || 'Operating Systems (CS501)',
+        sessionId: `LEC_${lectureDate}_01`,
+        lectureDate,
+        status: (r.status as any) || 'Present',
+        capturedAt: r.timestamp,
+        receivedAt: r.timestamp,
+        processedAt: r.timestamp,
+        deviceId: r.deviceId || 'ESP32-READER-01',
+        eventId: r.recordId,
+        correctedBy: r.correctedBy,
+        correctionReason: r.correctionReason,
+      };
+    });
+
+    // Merge: RTDB scans take precedence, unioned with Firestore records
+    const rtdbIds = new Set(mappedRtdb.map((r) => r.attendanceId));
+    const uniqueFirestore = records.filter((r) => !rtdbIds.has(r.attendanceId));
+    const merged = [...mappedRtdb, ...uniqueFirestore];
+
+    merged.sort((a, b) => {
+      const timeA = typeof a.capturedAt === 'number' ? a.capturedAt : new Date(a.capturedAt || a.lectureDate).getTime();
+      const timeB = typeof b.capturedAt === 'number' ? b.capturedAt : new Date(b.capturedAt || b.lectureDate).getTime();
+      return (timeB || 0) - (timeA || 0);
+    });
+
+    return merged;
+  }, [rtdbRecords, records, students, classes, subjects]);
+
   // Filtered List
   const filteredRecords = useMemo(() => {
-    return records.filter((r) => {
+    return combinedRecords.filter((r) => {
       if (selectedClass !== 'all' && r.classId !== selectedClass) return false;
       if (selectedStatus !== 'all' && r.status !== selectedStatus) return false;
       if (selectedDate && r.lectureDate !== selectedDate) return false;
@@ -112,19 +194,21 @@ export const RecordsPage: React.FC = () => {
         const roll = ((r as any).rollNumber || '').toLowerCase();
         const sub = (r.subjectId || '').toLowerCase();
         const sess = (r.sessionId || '').toLowerCase();
+        const dev = (r.deviceId || '').toLowerCase();
 
         return (
           stdId.includes(q) ||
           name.includes(q) ||
           roll.includes(q) ||
           sub.includes(q) ||
-          sess.includes(q)
+          sess.includes(q) ||
+          dev.includes(q)
         );
       }
 
       return true;
     });
-  }, [records, selectedClass, selectedStatus, selectedDate, searchQuery]);
+  }, [combinedRecords, selectedClass, selectedStatus, selectedDate, searchQuery]);
 
   // Summary Metrics
   const summary = useMemo(() => {
@@ -167,8 +251,7 @@ export const RecordsPage: React.FC = () => {
     setCorrectionError(null);
 
     try {
-      const correctCall = httpsCallable(functions, 'correctAttendanceRecordCall');
-      await correctCall({
+      await callCorrectAttendanceRecord({
         attendanceId: selectedRecord.attendanceId,
         newStatus,
         reason: correctionReason.trim(),
@@ -195,8 +278,7 @@ export const RecordsPage: React.FC = () => {
     setManualError(null);
 
     try {
-      const createCall = httpsCallable(functions, 'createManualAttendanceRecordCall');
-      await createCall({
+      await callCreateManualAttendanceRecord({
         ...manualForm,
         reason: manualForm.reason.trim(),
       });
@@ -264,6 +346,127 @@ export const RecordsPage: React.FC = () => {
     document.body.removeChild(link);
   };
 
+  // Helper to compile dynamic formal SGGS report metadata
+  const prepareReportMetadata = (): ReportMetadata => {
+    // 1. Department
+    let dept = 'CSE (CSE-3A)';
+    if (selectedClass !== 'all') {
+      const c = classes.find((cls) => cls.classId === selectedClass);
+      if (c) {
+        dept = `CSE (${c.code || c.name})`;
+      }
+    } else if (filteredRecords.length > 0) {
+      const firstClass = classes.find((c) => c.classId === filteredRecords[0].classId);
+      if (firstClass) {
+        dept = `CSE (${firstClass.code || firstClass.name})`;
+      }
+    }
+
+    // 2. Subject
+    let subj = filteredRecords[0]?.subjectId || 'Operating Systems (CS501)';
+    const foundSubject = subjects.find((s) => s.subjectId === subj || s.name === subj || s.code === subj);
+    if (foundSubject) {
+      subj = `${foundSubject.name} (${foundSubject.code || ''})`.trim();
+    }
+
+    // 3. Time
+    let sessionTime = '09:00 – 10:00 AM';
+    const firstRec = filteredRecords[0];
+    if (firstRec?.sessionId) {
+      const matchTt = timetable.find((t) => t.timetableId === firstRec.sessionId);
+      if (matchTt && matchTt.startTime && matchTt.endTime) {
+        sessionTime = `${matchTt.startTime} – ${matchTt.endTime}`;
+      }
+    }
+
+    // 4. Date
+    const attDate = selectedDate || filteredRecords[0]?.lectureDate || new Date().toISOString().split('T')[0];
+
+    return {
+      institutionName: 'SGGS Institute of Engineering and Technology, Nanded – 431606',
+      department: dept,
+      subject: subj,
+      time: sessionTime,
+      date: attDate,
+    };
+  };
+
+  // Prepare table data for export
+  const prepareExportRows = (): ExportAttendanceRow[] => {
+    return filteredRecords.map((r, idx) => {
+      let checkInTime = '—';
+      if (r.capturedAt) {
+        const d =
+          typeof r.capturedAt === 'number'
+            ? new Date(r.capturedAt < 10000000000 ? r.capturedAt * 1000 : r.capturedAt)
+            : new Date(r.capturedAt);
+        if (!isNaN(d.getTime())) {
+          checkInTime = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+        }
+      }
+
+      return {
+        srNo: idx + 1,
+        studentName: (r as any).studentName || r.studentId || 'Unknown Student',
+        rollNumber: (r as any).rollNumber || r.studentId || 'N/A',
+        enrollmentId: r.studentId || (r as any).rollNumber || 'N/A',
+        status: r.status,
+        checkInTime,
+        device: r.deviceId || 'ESP32-READER-01',
+      };
+    });
+  };
+
+  // Export to PDF
+  const handleExportPdf = async () => {
+    if (filteredRecords.length === 0) return;
+    setExportingPdf(true);
+    setExportFeedback(null);
+    try {
+      const meta = prepareReportMetadata();
+      const rows = prepareExportRows();
+      await exportAttendanceToPdf(rows, meta);
+      setExportFeedback({
+        type: 'success',
+        message: `Successfully generated and downloaded PDF report: SGGS_Attendance_Records_${meta.date}.pdf (${rows.length} records).`,
+      });
+    } catch (err: any) {
+      console.error('PDF export error:', err);
+      setExportFeedback({
+        type: 'error',
+        message: `Failed to export PDF: ${err.message || 'Unknown error'}`,
+      });
+    } finally {
+      setExportingPdf(false);
+      setTimeout(() => setExportFeedback(null), 6000);
+    }
+  };
+
+  // Export to Word (.docx)
+  const handleExportDocx = async () => {
+    if (filteredRecords.length === 0) return;
+    setExportingDocx(true);
+    setExportFeedback(null);
+    try {
+      const meta = prepareReportMetadata();
+      const rows = prepareExportRows();
+      await exportAttendanceToDocx(rows, meta);
+      setExportFeedback({
+        type: 'success',
+        message: `Successfully generated and downloaded editable Word report: SGGS_Attendance_Records_${meta.date}.docx (${rows.length} records).`,
+      });
+    } catch (err: any) {
+      console.error('DOCX export error:', err);
+      setExportFeedback({
+        type: 'error',
+        message: `Failed to export Word document: ${err.message || 'Unknown error'}`,
+      });
+    } finally {
+      setExportingDocx(false);
+      setTimeout(() => setExportFeedback(null), 6000);
+    }
+  };
+
   return (
     <div className={styles.container}>
       {/* Header */}
@@ -276,6 +479,30 @@ export const RecordsPage: React.FC = () => {
         </div>
 
         <div className={styles.headerActions}>
+          <Button
+            id="btn-export-pdf"
+            variant="secondary"
+            size="sm"
+            onClick={handleExportPdf}
+            disabled={filteredRecords.length === 0 || exportingPdf}
+            title="Export formal academic report to PDF (Times New Roman, SGGS Watermark)"
+          >
+            <FileText size={16} />
+            {exportingPdf ? 'Exporting PDF...' : 'Export PDF'}
+          </Button>
+
+          <Button
+            id="btn-export-docx"
+            variant="secondary"
+            size="sm"
+            onClick={handleExportDocx}
+            disabled={filteredRecords.length === 0 || exportingDocx}
+            title="Export formal academic report to editable Word document"
+          >
+            <FileSpreadsheet size={16} />
+            {exportingDocx ? 'Exporting Word...' : 'Export Word (.docx)'}
+          </Button>
+
           <Button
             id="btn-export-csv"
             variant="secondary"
@@ -299,213 +526,349 @@ export const RecordsPage: React.FC = () => {
         </div>
       </div>
 
-      {/* Summary Cards */}
-      <div className={styles.summaryGrid}>
-        <div className={styles.summaryCard}>
-          <div className={`${styles.summaryIcon} ${styles.iconAll}`}>
-            <ClipboardList size={22} />
-          </div>
-          <div>
-            <div className={styles.summaryLabel}>Total Records</div>
-            <div className={styles.summaryCount}>{summary.total}</div>
-          </div>
+      {/* Export Operation Feedback Banner */}
+      {exportFeedback && (
+        <div
+          className={
+            exportFeedback.type === 'success' ? styles.feedbackSuccess : styles.feedbackError
+          }
+        >
+          {exportFeedback.type === 'success' ? <CheckCircle2 size={16} /> : <AlertTriangle size={16} />}
+          <span>{exportFeedback.message}</span>
         </div>
+      )}
 
-        <div className={styles.summaryCard}>
-          <div className={`${styles.summaryIcon} ${styles.iconPresent}`}>
-            <CheckCircle2 size={22} />
-          </div>
-          <div>
-            <div className={styles.summaryLabel}>Present</div>
-            <div className={styles.summaryCount}>{summary.present}</div>
-          </div>
-        </div>
-
-        <div className={styles.summaryCard}>
-          <div className={`${styles.summaryIcon} ${styles.iconLate}`}>
-            <Clock size={22} />
-          </div>
-          <div>
-            <div className={styles.summaryLabel}>Late</div>
-            <div className={styles.summaryCount}>{summary.late}</div>
-          </div>
-        </div>
-
-        <div className={styles.summaryCard}>
-          <div className={`${styles.summaryIcon} ${styles.iconExcused}`}>
-            <ShieldCheck size={22} />
-          </div>
-          <div>
-            <div className={styles.summaryLabel}>Excused / Corrected</div>
-            <div className={styles.summaryCount}>{summary.corrected}</div>
-          </div>
-        </div>
+      {/* Tab Switcher */}
+      <div className={styles.tabBar}>
+        <button
+          id="tab-attendance-registers"
+          className={`${styles.tabBtn} ${activeTab === 'records' ? styles.tabBtnActive : ''}`}
+          onClick={() => setActiveTab('records')}
+        >
+          <ClipboardList size={16} />
+          Attendance Registers ({combinedRecords.length})
+        </button>
+        <button
+          id="tab-audit-trail"
+          className={`${styles.tabBtn} ${activeTab === 'audit' ? styles.tabBtnActive : ''}`}
+          onClick={() => setActiveTab('audit')}
+        >
+          <ShieldAlert size={16} />
+          Immutable Audit Trail ({auditLogs.length})
+        </button>
       </div>
 
-      {/* Search and Filters */}
-      <div className={styles.controlsBar}>
-        <div className={styles.filterRow}>
-          <div className={styles.searchBox}>
-            <Search size={16} color="var(--color-text-secondary)" />
-            <input
-              id="input-search-records"
-              type="text"
-              placeholder="Search by student, roll number, or subject..."
-              className={styles.searchInput}
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-            />
+      {activeTab === 'records' && (
+        <>
+          {/* Summary Cards */}
+          <div className={styles.summaryGrid}>
+            <div className={styles.summaryCard}>
+              <div className={`${styles.summaryIcon} ${styles.iconAll}`}>
+                <ClipboardList size={22} />
+              </div>
+              <div>
+                <div className={styles.summaryLabel}>Total Records</div>
+                <div className={styles.summaryCount}>{summary.total}</div>
+              </div>
+            </div>
+
+            <div className={styles.summaryCard}>
+              <div className={`${styles.summaryIcon} ${styles.iconPresent}`}>
+                <CheckCircle2 size={22} />
+              </div>
+              <div>
+                <div className={styles.summaryLabel}>Present</div>
+                <div className={styles.summaryCount}>{summary.present}</div>
+              </div>
+            </div>
+
+            <div className={styles.summaryCard}>
+              <div className={`${styles.summaryIcon} ${styles.iconLate}`}>
+                <Clock size={22} />
+              </div>
+              <div>
+                <div className={styles.summaryLabel}>Late</div>
+                <div className={styles.summaryCount}>{summary.late}</div>
+              </div>
+            </div>
+
+            <div className={styles.summaryCard}>
+              <div className={`${styles.summaryIcon} ${styles.iconExcused}`}>
+                <ShieldCheck size={22} />
+              </div>
+              <div>
+                <div className={styles.summaryLabel}>Excused / Corrected</div>
+                <div className={styles.summaryCount}>{summary.corrected}</div>
+              </div>
+            </div>
           </div>
 
-          <select
-            id="select-filter-class"
-            className={styles.selectInput}
-            value={selectedClass}
-            onChange={(e) => setSelectedClass(e.target.value)}
-          >
-            <option value="all">All Classes</option>
-            {classes.map((c) => (
-              <option key={c.classId} value={c.classId}>
-                {c.code || c.name}
-              </option>
-            ))}
-          </select>
+          {/* Search and Filters */}
+          <div className={styles.controlsBar}>
+            <div className={styles.filterRow}>
+              <div className={styles.searchBox}>
+                <Search size={16} color="var(--color-text-secondary)" />
+                <input
+                  id="input-search-records"
+                  type="text"
+                  placeholder="Search by student, roll number, or subject..."
+                  className={styles.searchInput}
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                />
+              </div>
 
-          <select
-            id="select-filter-status"
-            className={styles.selectInput}
-            value={selectedStatus}
-            onChange={(e) => setSelectedStatus(e.target.value)}
-          >
-            <option value="all">All Statuses</option>
-            <option value="Present">Present</option>
-            <option value="Late">Late</option>
-            <option value="Excused">Excused</option>
-            <option value="Absent">Absent</option>
-          </select>
+              <select
+                id="select-filter-class"
+                className={styles.selectInput}
+                value={selectedClass}
+                onChange={(e) => setSelectedClass(e.target.value)}
+              >
+                <option value="all">All Classes</option>
+                {classes.map((c) => (
+                  <option key={c.classId} value={c.classId}>
+                    {c.code || c.name}
+                  </option>
+                ))}
+              </select>
 
-          <input
-            id="input-filter-date"
-            type="date"
-            className={styles.dateInput}
-            value={selectedDate}
-            onChange={(e) => setSelectedDate(e.target.value)}
-          />
+              <select
+                id="select-filter-status"
+                className={styles.selectInput}
+                value={selectedStatus}
+                onChange={(e) => setSelectedStatus(e.target.value)}
+              >
+                <option value="all">All Statuses</option>
+                <option value="Present">Present</option>
+                <option value="Late">Late</option>
+                <option value="Excused">Excused</option>
+                <option value="Absent">Absent</option>
+              </select>
 
-          {(selectedClass !== 'all' || selectedStatus !== 'all' || selectedDate || searchQuery) && (
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => {
-                setSelectedClass('all');
-                setSelectedStatus('all');
-                setSelectedDate('');
-                setSearchQuery('');
-              }}
-            >
-              Reset Filters
-            </Button>
+              <input
+                id="input-filter-date"
+                type="date"
+                className={styles.dateInput}
+                value={selectedDate}
+                onChange={(e) => setSelectedDate(e.target.value)}
+              />
+
+              {(selectedClass !== 'all' || selectedStatus !== 'all' || selectedDate || searchQuery) && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => {
+                    setSelectedClass('all');
+                    setSelectedStatus('all');
+                    setSelectedDate('');
+                    setSearchQuery('');
+                  }}
+                >
+                  Reset Filters
+                </Button>
+              )}
+            </div>
+          </div>
+
+          {/* Records Table */}
+          <div className={styles.tableContainer}>
+            {filteredRecords.length === 0 ? (
+              <EmptyState
+                title={loading ? 'Loading Attendance Records...' : 'No Attendance Records Found'}
+                description={
+                  loading
+                    ? 'Retrieving authoritative records from Firestore and RTDB...'
+                    : 'No attendance records match your current filters. Trigger a biometric scan via the Live Stream page or hardware reader.'
+                }
+                icon={<ClipboardList size={28} />}
+              />
+            ) : (
+              <table className={styles.recordsTable}>
+                <thead>
+                  <tr>
+                    <th>Student</th>
+                    <th>Subject & Session</th>
+                    <th>Lecture Date</th>
+                    <th>Status</th>
+                    <th>Method / Device</th>
+                    <th style={{ textAlign: 'right' }}>Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {filteredRecords.map((r) => {
+                    const name = (r as any).studentName || r.studentId;
+                    const roll = (r as any).rollNumber || r.studentId;
+                    const initials = name
+                      .split(' ')
+                      .map((n: string) => n[0])
+                      .join('')
+                      .slice(0, 2);
+
+                    return (
+                      <tr key={r.attendanceId} className={styles.tableRow}>
+                        <td>
+                          <div className={styles.studentCell}>
+                            <div className={styles.avatar}>{initials}</div>
+                            <div>
+                              <span className={styles.studentName}>{name}</span>
+                              <span className={styles.studentRoll}>{roll}</span>
+                            </div>
+                          </div>
+                        </td>
+
+                        <td>
+                          <div>
+                            <div className={styles.subjectName}>{r.subjectId}</div>
+                            <div className={styles.sessionSub}>{r.sessionId}</div>
+                          </div>
+                        </td>
+
+                        <td>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                            <Calendar size={13} color="var(--color-text-muted)" />
+                            <span>{r.lectureDate}</span>
+                          </div>
+                        </td>
+
+                        <td>
+                          <div>
+                            <StatusBadge status={r.status} />
+                            {r.correctedBy && (
+                              <div
+                                className={styles.correctionTag}
+                                title={`Corrected by ${r.correctedBy}. Reason: ${r.correctionReason || 'N/A'}`}
+                              >
+                                <ShieldAlert size={11} /> Corrected
+                              </div>
+                            )}
+                          </div>
+                        </td>
+
+                        <td>
+                          <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-xs)' }}>
+                            {r.deviceId || 'Scanner'}
+                          </span>
+                        </td>
+
+                        <td style={{ textAlign: 'right' }}>
+                          <button
+                            className={styles.actionBtn}
+                            onClick={() => handleOpenCorrection(r)}
+                            title="Audited Attendance Correction"
+                          >
+                            <Edit2 size={12} />
+                            Correct
+                          </button>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            )}
+          </div>
+        </>
+      )}
+
+      {/* Audit Trail View */}
+      {activeTab === 'audit' && (
+        <div className={styles.tableContainer}>
+          {auditLogs.length === 0 ? (
+            <EmptyState
+              title="No Audit Entries Found"
+              description="Administrative actions, corrections, and overrides will be logged here."
+              icon={<ShieldAlert size={28} />}
+            />
+          ) : (
+            <table className={styles.recordsTable}>
+              <thead>
+                <tr>
+                  <th>Action</th>
+                  <th>Target Resource</th>
+                  <th>Actor Email</th>
+                  <th>Timestamp</th>
+                  <th>Audit Details & Institutional Justification</th>
+                </tr>
+              </thead>
+              <tbody>
+                {auditLogs.map((log) => {
+                  const logId = log.id || log.logId || `log_${Math.random()}`;
+                  const dateStr = log.timestamp ? new Date(log.timestamp).toLocaleString() : 'Just now';
+                  const detailsStr = log.details
+                    ? typeof log.details === 'object'
+                      ? JSON.stringify(log.details, null, 2)
+                      : String(log.details)
+                    : '-';
+
+                  return (
+                    <tr key={logId} className={styles.tableRow}>
+                      <td>
+                        <span
+                          style={{
+                            fontFamily: 'var(--font-mono)',
+                            fontSize: 'var(--text-xs)',
+                            fontWeight: 'var(--font-semibold)',
+                            background: 'rgba(37, 99, 235, 0.1)',
+                            color: '#2563EB',
+                            padding: '3px 8px',
+                            borderRadius: '4px',
+                            display: 'inline-block',
+                          }}
+                        >
+                          {log.action}
+                        </span>
+                      </td>
+                      <td>
+                        <div style={{ display: 'flex', flexDirection: 'column' }}>
+                          <span style={{ fontWeight: 'var(--font-medium)' }}>{log.targetType}</span>
+                          <span
+                            style={{
+                              fontSize: 'var(--text-xs)',
+                              color: 'var(--color-text-secondary)',
+                              fontFamily: 'var(--font-mono)',
+                            }}
+                          >
+                            {log.targetId}
+                          </span>
+                        </div>
+                      </td>
+                      <td>
+                        <span style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-secondary)' }}>
+                          {log.actorEmail}
+                        </span>
+                      </td>
+                      <td>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: 'var(--text-xs)' }}>
+                          <Clock size={12} color="var(--color-text-muted)" />
+                          <span>{dateStr}</span>
+                        </div>
+                      </td>
+                      <td>
+                        <pre
+                          style={{
+                            margin: 0,
+                            fontSize: '11px',
+                            fontFamily: 'var(--font-mono)',
+                            background: 'var(--color-page-bg)',
+                            padding: '6px 10px',
+                            borderRadius: '6px',
+                            border: '1px solid var(--color-border)',
+                            whiteSpace: 'pre-wrap',
+                            maxHeight: '90px',
+                            overflowY: 'auto',
+                          }}
+                        >
+                          {detailsStr}
+                        </pre>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
           )}
         </div>
-      </div>
-
-      {/* Records Table */}
-      <div className={styles.tableContainer}>
-        {filteredRecords.length === 0 ? (
-          <EmptyState
-            title={loading ? 'Loading Attendance Records...' : 'No Attendance Records Found'}
-            description={
-              loading
-                ? 'Retrieving authoritative records from Firestore...'
-                : 'No attendance records match your current filters. Trigger a biometric scan via the Live Stream page or simulator.'
-            }
-            icon={<ClipboardList size={28} />}
-          />
-        ) : (
-          <table className={styles.recordsTable}>
-            <thead>
-              <tr>
-                <th>Student</th>
-                <th>Subject & Session</th>
-                <th>Lecture Date</th>
-                <th>Status</th>
-                <th>Method / Device</th>
-                <th style={{ textAlign: 'right' }}>Actions</th>
-              </tr>
-            </thead>
-            <tbody>
-              {filteredRecords.map((r) => {
-                const name = (r as any).studentName || r.studentId;
-                const roll = (r as any).rollNumber || r.studentId;
-                const initials = name
-                  .split(' ')
-                  .map((n: string) => n[0])
-                  .join('')
-                  .slice(0, 2);
-
-                return (
-                  <tr key={r.attendanceId} className={styles.tableRow}>
-                    <td>
-                      <div className={styles.studentCell}>
-                        <div className={styles.avatar}>{initials}</div>
-                        <div>
-                          <span className={styles.studentName}>{name}</span>
-                          <span className={styles.studentRoll}>{roll}</span>
-                        </div>
-                      </div>
-                    </td>
-
-                    <td>
-                      <div>
-                        <div className={styles.subjectName}>{r.subjectId}</div>
-                        <div className={styles.sessionSub}>{r.sessionId}</div>
-                      </div>
-                    </td>
-
-                    <td>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                        <Calendar size={13} color="var(--color-text-muted)" />
-                        <span>{r.lectureDate}</span>
-                      </div>
-                    </td>
-
-                    <td>
-                      <div>
-                        <StatusBadge status={r.status} />
-                        {r.correctedBy && (
-                          <div
-                            className={styles.correctionTag}
-                            title={`Corrected by ${r.correctedBy}. Reason: ${r.correctionReason || 'N/A'}`}
-                          >
-                            <ShieldAlert size={11} /> Corrected
-                          </div>
-                        )}
-                      </div>
-                    </td>
-
-                    <td>
-                      <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-xs)' }}>
-                        {r.deviceId || 'Scanner'}
-                      </span>
-                    </td>
-
-                    <td style={{ textAlign: 'right' }}>
-                      <button
-                        className={styles.actionBtn}
-                        onClick={() => handleOpenCorrection(r)}
-                        title="Audited Attendance Correction"
-                      >
-                        <Edit2 size={12} />
-                        Correct
-                      </button>
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        )}
-      </div>
+      )}
 
       {/* Audited Correction Modal */}
       {selectedRecord && (

@@ -18,10 +18,12 @@ import {
   doc,
   setDoc,
   serverTimestamp,
-  getDocs,
 } from 'firebase/firestore';
-import { httpsCallable } from 'firebase/functions';
-import { db, functions } from '@/lib/firebase';
+import { db, rtdb } from '@/lib/firebase';
+import { useRtdbAttendance } from '@/lib/useRtdbAttendance';
+import { useSyncedCollection } from '@/lib/useSyncedData';
+import { callRequestEnrollment } from '@/lib/callables';
+import { ref, set } from 'firebase/database';
 import { DeviceInfo, Student } from '@/types';
 import { Button, Modal, EmptyState } from '@/components';
 import styles from './DevicesPage.module.css';
@@ -35,6 +37,8 @@ export const DevicesPage: React.FC = () => {
   const [devices, setDevices] = useState<DeviceInfo[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
   const [now, setNow] = useState<number>(Date.now());
+  const { devices: rtdbDevices } = useRtdbAttendance();
+  const { data: students } = useSyncedCollection<Student>('students', 'studentId');
 
   // Registration Modal
   const [registerModalOpen, setRegisterModalOpen] = useState<boolean>(false);
@@ -50,7 +54,6 @@ export const DevicesPage: React.FC = () => {
   // Enrollment Modal
   const [enrollModalOpen, setEnrollModalOpen] = useState<boolean>(false);
   const [targetDevice, setTargetDevice] = useState<DeviceInfo | null>(null);
-  const [students, setStudents] = useState<Student[]>([]);
   const [selectedStudentId, setSelectedStudentId] = useState<string>('');
   const [submittingEnroll, setSubmittingEnroll] = useState<boolean>(false);
   const [enrollFeedback, setEnrollFeedback] = useState<string | null>(null);
@@ -82,30 +85,54 @@ export const DevicesPage: React.FC = () => {
     return () => unsubscribe();
   }, []);
 
-  // Fetch unenrolled students for enrollment modal
-  useEffect(() => {
-    const fetchStudents = async () => {
-      try {
-        const snap = await getDocs(collection(db, 'students'));
-        const list: Student[] = [];
-        snap.forEach((d) => list.push({ ...d.data(), studentId: d.id } as Student));
-        setStudents(list);
-      } catch (err) {
-        console.warn('Failed to load students:', err);
-      }
-    };
-    fetchStudents();
-  }, []);
 
-  // Compute online status dynamically
+  // Compute online status dynamically and merge RTDB device heartbeats
   const enrichedDevices = useMemo(() => {
-    return devices.map((dev) => {
+    const devMap = new Map<string, DeviceInfo>();
+
+    // 1. Add Firestore devices
+    devices.forEach((d) => {
+      devMap.set(d.deviceId, { ...d });
+    });
+
+    // 2. Overlay live telemetry from RTDB
+    Object.keys(rtdbDevices).forEach((devId) => {
+      const rtdbDev = rtdbDevices[devId];
+      const existing = devMap.get(devId);
+      if (existing) {
+        devMap.set(devId, {
+          ...existing,
+          freeHeap: rtdbDev.freeHeap ?? existing.freeHeap,
+          wifiSignalRssi: rtdbDev.wifiSignalRssi ?? existing.wifiSignalRssi,
+          sensorStatus: (rtdbDev.sensorStatus as any) || (existing as any).sensorStatus || 'ok',
+          lastHeartbeatAt: rtdbDev.lastHeartbeat ?? existing.lastHeartbeatAt,
+        });
+      } else {
+        devMap.set(devId, {
+          deviceId: devId,
+          deviceName: devId.replace(/-/g, ' '),
+          location: 'Live Hardware Reader',
+          active: true,
+          status: 'online',
+          enrolledCount: 0,
+          firmwareVersion: 'v1.2.0-esp32',
+          wifiSignalRssi: rtdbDev.wifiSignalRssi ?? -45,
+          freeHeap: rtdbDev.freeHeap ?? 235000,
+          lastHeartbeatAt: rtdbDev.lastHeartbeat ?? Date.now(),
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+          sensorStatus: (rtdbDev.sensorStatus as any) || 'ok',
+        } as DeviceInfo);
+      }
+    });
+
+    return Array.from(devMap.values()).map((dev) => {
       let isOnline = false;
       let lastHeartbeatMs: number | null = null;
       let secondsAgo: number | null = null;
 
       if (dev.lastHeartbeatAt) {
-        if (dev.lastHeartbeatAt.seconds) {
+        if (typeof dev.lastHeartbeatAt === 'object' && dev.lastHeartbeatAt.seconds) {
           lastHeartbeatMs = dev.lastHeartbeatAt.seconds * 1000;
         } else if (typeof dev.lastHeartbeatAt === 'number') {
           lastHeartbeatMs = dev.lastHeartbeatAt < 10000000000 ? dev.lastHeartbeatAt * 1000 : dev.lastHeartbeatAt;
@@ -113,7 +140,7 @@ export const DevicesPage: React.FC = () => {
           lastHeartbeatMs = new Date(dev.lastHeartbeatAt).getTime();
         }
 
-        if (lastHeartbeatMs) {
+        if (lastHeartbeatMs && !isNaN(lastHeartbeatMs)) {
           secondsAgo = Math.max(0, Math.round((now - lastHeartbeatMs) / 1000));
           isOnline = secondsAgo <= OFFLINE_THRESHOLD_SECONDS;
         }
@@ -125,7 +152,7 @@ export const DevicesPage: React.FC = () => {
         secondsAgo,
       };
     });
-  }, [devices, now]);
+  }, [devices, rtdbDevices, now]);
 
   // KPI Calculations
   const stats = useMemo(() => {
@@ -235,14 +262,24 @@ export const DevicesPage: React.FC = () => {
     setEnrollFeedback(null);
 
     try {
-      const enrollCall = httpsCallable(functions, 'requestEnrollmentCall');
-      await enrollCall({
+      await callRequestEnrollment({
         studentId: student.studentId,
-        studentName: student.fullName,
-        rollNumber: student.rollNumber,
-        classId: student.classId,
         deviceId: targetDevice.deviceId,
       });
+
+      // Mirror command to Realtime Database so hardware reading RTDB catches it immediately
+      try {
+        await set(ref(rtdb, `devices/${targetDevice.deviceId}/pendingEnrollment`), {
+          requestId: `req_${Date.now()}`,
+          studentId: student.studentId,
+          studentName: student.fullName,
+          rollNumber: student.rollNumber,
+          command: 'ENROLL',
+          requestedAt: Date.now(),
+        });
+      } catch (rtdbErr) {
+        console.warn('RTDB enrollment mirror notice:', rtdbErr);
+      }
 
       setEnrollFeedback(`Enrollment queued! Next heartbeat from ${targetDevice.deviceId} will initiate capture.`);
       setTimeout(() => {
